@@ -1,0 +1,391 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: PaymentProof - Evidence-backed receivables assistant for Indian MSMEs
+
+Globals:
+  Function:
+    Timeout: 30
+    MemorySize: 256
+    Runtime: nodejs20.x
+    Environment:
+      Variables:
+        INVOICES_TABLE: !Ref InvoicesTable
+        DOCUMENTS_BUCKET: !Ref DocumentsBucket
+        CORS_ORIGIN: !Ref CorsOrigin
+    Tracing: Active
+    Layers:
+      - !Ref DependenciesLayer
+
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+  CorsOrigin:
+    Type: String
+    Default: 'http://localhost:5173'
+    Description: Frontend origin for CORS
+  CognitoUserPoolArn:
+    Type: String
+    Default: 'arn:aws:cognito-idp:ap-south-1:ACCOUNT_ID:userpool/POOL_ID'
+    Description: Cognito User Pool ARN for API authorization
+
+Resources:
+
+  # =====================
+  # S3 Private Document Bucket
+  # =====================
+  DocumentsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub 'paymentproof-documents-${Environment}-${AWS::AccountId}'
+      AccessControl: Private
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteIncompleteUploads
+            Status: Enabled
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 1
+      CorsConfiguration:
+        CorsRules:
+          - AllowedHeaders: ['*']
+            AllowedMethods: [GET, PUT, POST]
+            AllowedOrigins: [!Ref CorsOrigin]
+            MaxAge: 300
+      Tags:
+        - Key: Project
+          Value: PaymentProof
+        - Key: Environment
+          Value: !Ref Environment
+
+  # =====================
+  # DynamoDB Invoice Table
+  # =====================
+  InvoicesTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub 'PaymentProof-Invoices-${Environment}'
+      BillingMode: PAY_PER_REQUEST
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+      AttributeDefinitions:
+        - AttributeName: userId
+          AttributeType: S
+        - AttributeName: invoiceId
+          AttributeType: S
+        - AttributeName: status
+          AttributeType: S
+        - AttributeName: updatedAt
+          AttributeType: S
+      KeySchema:
+        - AttributeName: userId
+          KeyType: HASH
+        - AttributeName: invoiceId
+          KeyType: RANGE
+      GlobalSecondaryIndexes:
+        - IndexName: status-updatedAt-index
+          KeySchema:
+            - AttributeName: status
+              KeyType: HASH
+            - AttributeName: updatedAt
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      Tags:
+        - Key: Project
+          Value: PaymentProof
+        - Key: Environment
+          Value: !Ref Environment
+
+  # =====================
+  # Cognito User Pool
+  # =====================
+  CognitoUserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub 'PaymentProof-Users-${Environment}'
+      AutoVerifiedAttributes:
+        - email
+      UsernameAttributes:
+        - email
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 8
+          RequireUppercase: true
+          RequireLowercase: true
+          RequireNumbers: true
+          RequireSymbols: false
+      Schema:
+        - Name: email
+          AttributeDataType: String
+          Required: true
+          Mutable: true
+        - Name: businessName
+          AttributeDataType: String
+          Required: false
+          Mutable: true
+      Tags:
+        Project: PaymentProof
+        Environment: !Ref Environment
+
+  CognitoUserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      ClientName: !Sub 'PaymentProof-App-${Environment}'
+      UserPoolId: !Ref CognitoUserPool
+      GenerateSecret: false
+      ExplicitAuthFlows:
+        - ALLOW_USER_SRP_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+      PreventUserExistenceErrors: ENABLED
+
+  # =====================
+  # Lambda Dependencies Layer
+  # =====================
+  DependenciesLayer:
+    Type: AWS::Serverless::LayerVersion
+    Properties:
+      LayerName: !Sub 'paymentproof-deps-${Environment}'
+      ContentUri: ../backend/layer/
+      CompatibleRuntimes:
+        - nodejs20.x
+
+  # =====================
+  # API Gateway
+  # =====================
+  PaymentProofApi:
+    Type: AWS::Serverless::Api
+    Properties:
+      Name: !Sub 'PaymentProof-API-${Environment}'
+      StageName: !Ref Environment
+      Auth:
+        DefaultAuthorizer: CognitoAuthorizer
+        Authorizers:
+          CognitoAuthorizer:
+            UserPoolArn: !GetAtt CognitoUserPool.Arn
+      Cors:
+        AllowMethods: "'GET,POST,PATCH,DELETE,OPTIONS'"
+        AllowHeaders: "'Content-Type,Authorization'"
+        AllowOrigin: !Sub "'${CorsOrigin}'"
+      AccessLogSetting:
+        DestinationArn: !GetAtt ApiAccessLogGroup.Arn
+      MethodSettings:
+        - ResourcePath: '/*'
+          HttpMethod: '*'
+          ThrottlingBurstLimit: 50
+          ThrottlingRateLimit: 10
+
+  ApiAccessLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/paymentproof/api/${Environment}'
+      RetentionInDays: 30
+
+  # =====================
+  # Lambda IAM Role (shared)
+  # =====================
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'PaymentProof-Lambda-Role-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+        - 'arn:aws:iam::aws:policy/AWSXRayDaemonWriteAccess'
+      Policies:
+        - PolicyName: DynamoDBInvoicesPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:DeleteItem
+                  - dynamodb:Query
+                Resource:
+                  - !GetAtt InvoicesTable.Arn
+                  - !Sub '${InvoicesTable.Arn}/index/*'
+        - PolicyName: S3DocumentsPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                Resource: !Sub '${DocumentsBucket.Arn}/documents/*'
+              - Effect: Allow
+                Action:
+                  - s3:ListBucket
+                Resource: !GetAtt DocumentsBucket.Arn
+        - PolicyName: TextractPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - textract:AnalyzeDocument
+                  - textract:DetectDocumentText
+                Resource: '*'
+
+  # =====================
+  # Lambda Functions
+  # =====================
+  GetUploadUrlFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub 'PaymentProof-GetUploadUrl-${Environment}'
+      CodeUri: ../backend/dist/
+      Handler: handlers/getUploadUrl.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Events:
+        Api:
+          Type: Api
+          Properties:
+            RestApiId: !Ref PaymentProofApi
+            Path: /invoices/upload-url
+            Method: POST
+
+  ListInvoicesFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub 'PaymentProof-ListInvoices-${Environment}'
+      CodeUri: ../backend/dist/
+      Handler: handlers/listInvoices.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Events:
+        Api:
+          Type: Api
+          Properties:
+            RestApiId: !Ref PaymentProofApi
+            Path: /invoices
+            Method: GET
+
+  GetInvoiceFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub 'PaymentProof-GetInvoice-${Environment}'
+      CodeUri: ../backend/dist/
+      Handler: handlers/getInvoice.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Events:
+        Api:
+          Type: Api
+          Properties:
+            RestApiId: !Ref PaymentProofApi
+            Path: /invoices/{invoiceId}
+            Method: GET
+
+  UpdateInvoiceFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub 'PaymentProof-UpdateInvoice-${Environment}'
+      CodeUri: ../backend/dist/
+      Handler: handlers/updateInvoice.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Events:
+        Api:
+          Type: Api
+          Properties:
+            RestApiId: !Ref PaymentProofApi
+            Path: /invoices/{invoiceId}
+            Method: PATCH
+
+  DeleteInvoiceFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub 'PaymentProof-DeleteInvoice-${Environment}'
+      CodeUri: ../backend/dist/
+      Handler: handlers/deleteInvoice.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Events:
+        Api:
+          Type: Api
+          Properties:
+            RestApiId: !Ref PaymentProofApi
+            Path: /invoices/{invoiceId}
+            Method: DELETE
+
+  ProcessInvoiceFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub 'PaymentProof-ProcessInvoice-${Environment}'
+      CodeUri: ../backend/dist/
+      Handler: handlers/processInvoice.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 60
+      Events:
+        Api:
+          Type: Api
+          Properties:
+            RestApiId: !Ref PaymentProofApi
+            Path: /invoices/{invoiceId}/process
+            Method: POST
+
+  GenerateReminderFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub 'PaymentProof-GenerateReminder-${Environment}'
+      CodeUri: ../backend/dist/
+      Handler: handlers/generateReminder.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Events:
+        Api:
+          Type: Api
+          Properties:
+            RestApiId: !Ref PaymentProofApi
+            Path: /invoices/{invoiceId}/reminder
+            Method: POST
+
+  # =====================
+  # CloudWatch Alarms
+  # =====================
+  LambdaErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub 'PaymentProof-LambdaErrors-${Environment}'
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 5
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+
+Outputs:
+  ApiUrl:
+    Description: API Gateway endpoint URL
+    Value: !Sub 'https://${PaymentProofApi}.execute-api.${AWS::Region}.amazonaws.com/${Environment}'
+  DocumentsBucketName:
+    Description: S3 bucket name for documents
+    Value: !Ref DocumentsBucket
+  InvoicesTableName:
+    Description: DynamoDB table name
+    Value: !Ref InvoicesTable
+  CognitoUserPoolId:
+    Description: Cognito User Pool ID
+    Value: !Ref CognitoUserPool
+  CognitoClientId:
+    Description: Cognito App Client ID
+    Value: !Ref CognitoUserPoolClient

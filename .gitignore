@@ -1,0 +1,45 @@
+# Dependencies
+node_modules/
+frontend/node_modules/
+backend/node_modules/
+
+# Build output
+frontend/dist/
+backend/dist/
+
+# Environment variables — never commit these
+.env
+.env.local
+.env.production
+frontend/.env.local
+frontend/.env.production
+infrastructure/.env
+
+# AWS SAM
+infrastructure/samconfig.toml
+.aws-sam/
+
+# CDK
+infrastructure/cdk.out/
+
+# Logs
+*.log
+npm-debug.log*
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/
+.idea/
+*.swp
+
+# TypeScript cache
+*.tsbuildinfo
+
+# Test coverage
+coverage/
+
+# Temporary scripts
+frontend/fix-imports.ps1
